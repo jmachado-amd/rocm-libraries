@@ -1,5 +1,5 @@
 /* **************************************************************************
- * Copyright (C) 2020-2025 Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) 2020-2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -27,6 +27,9 @@
 
 #pragma once
 
+#include <limits>
+
+#include "common/matrix_utils/matrix_utils.hpp"
 #include "common/misc/client_util.hpp"
 #include "common/misc/clientcommon.hpp"
 #include "common/misc/lapack_host_reference.hpp"
@@ -127,6 +130,56 @@ void steqr_initData(const rocblas_handle handle,
         hE[0][k] = 0;
         hE[0][k - 1] = 0;
 
+        // New matrix initialization
+        using HMat = HostMatrix<T, rocblas_int>;
+        using BDesc = typename HMat::BlockDescriptor;
+
+        std::size_t lda = n;
+        std::size_t size_A = size_t(lda) * n;
+        std::size_t bc = 1;
+        host_batch_vector<T> hA(size_A, 1, bc);
+        rocblas_init<T>(hA, true);
+        auto eps = std::numeric_limits<S>::epsilon();
+
+        /* auto hAw = HMat::Wrap(hA[0], lda, n); */
+        /* if(hAw) // update matrix hA if n >= 1 */
+        /* { */
+        /*     S scale = 0.001; */
+        /*     std::cout << "::: Scale: " << scale << std::endl; */
+        /*     auto eigs = std::numeric_limits<S>::epsilon() * HMat::FromRange(1, n - 1, n - 1); */
+        /*     eigs = scale * cat(eigs, HMat::Ones(1, 1)); */
+        /*     std::cout << "::: Input eigenvalues: " << std::endl; */
+        /*     eigs.print(); */
+        /*     auto [Q, _] = qr((*hAw).block(BDesc().nrows(n).ncols(n))); */
+        /*     hAw->set_to_zero(); */
+
+        /*     hAw->copy_data_from(Q * HMat::Zeros(n).diag(eigs) * adjoint(Q)); */
+        /* } */
+
+        auto hAw = HMat::Wrap(hA[0], lda, n);
+        if(hAw) // update matrix hA if n >= 1
+        {
+            /* S scale = std::numeric_limits<S>::epsilon() * 100; // This pass */
+            S scale = std::numeric_limits<S>::epsilon() * 10; // This fails
+            std::cout << "::: Scale: " << scale << std::endl;
+            auto A = HMat::Zeros(n, n);
+            auto E = HMat::Ones(n - 1, 1);
+            auto D = 2 * HMat::Ones(n, 1);
+
+            A.diag(D);
+            A.sup_diag(E);
+            A.sub_diag(E);
+
+            hAw->set_to_zero();
+            hAw->copy_data_from(scale * A);
+        }
+
+        host_batch_vector<T> tau(n, 1, bc);
+        std::size_t lwork = n * n;
+        host_batch_vector<T> work(lwork, 1, bc);
+        cpu_sytrd_hetrd(rocblas_fill_lower, n, hAw->data(), lda, hD[0], hE[0], tau[0], work[0],
+                        lwork);
+
         // initialize C to the identity matrix
         if(evect == rocblas_evect_original)
         {
@@ -171,8 +224,12 @@ void steqr_getError(const rocblas_handle handle,
                     Th& hCRes,
                     Uh& hInfo,
                     Uh& hInfoRes,
-                    double* max_err)
+                    double* max_err,
+                    double* max_errv,
+                    double* max_errr)
 {
+    using HMat = HostMatrix<T, rocblas_int>;
+    using BDesc = typename HMat::BlockDescriptor;
     using S = decltype(std::real(T{}));
 
     size_t lwork = (evect == rocblas_evect_none ? 0 : 2 * n - 2);
@@ -202,11 +259,18 @@ void steqr_getError(const rocblas_handle handle,
             for(rocblas_int j = i; j < n; j++)
             {
                 if(i == j)
+                {
                     hA[0][i + j * lda] = hD[0][i];
+                }
                 else if(i + 1 == j)
+                {
                     hA[0][i + j * lda] = hE[0][i];
+                    hA[0][j + i * lda] = hE[0][i];
+                }
                 else
+                {
                     hA[0][i + j * lda] = 0;
+                }
             }
         }
     }
@@ -231,27 +295,60 @@ void steqr_getError(const rocblas_handle handle,
         err = norm_error('F', 1, n, 1, hD[0], hDRes[0]);
         *max_err = err > *max_err ? err : *max_err;
 
+        // Computed eigenvalues
+        auto l_roc = (*HMat::Convert(hDRes[0], 1, n)).block(BDesc().nrows(1).ncols(n));
+        std::cout << "::: rocsolver eigenvalues: " << std::endl;
+        l_roc.print();
+        auto l_lap = (*HMat::Convert(hD[0], 1, n)).block(BDesc().nrows(1).ncols(n));
+        std::cout << "::: lapack eigenvalues: " << std::endl;
+        l_lap.print();
+
         // check eigenvectors if required
         if(evect != rocblas_evect_none)
         {
             // both eigenvalues and eigenvectors needed; need to implicitly test
             // eigenvectors due to non-uniqueness of eigenvectors under scaling
 
-            // multiply A with each of the n eigenvectors and divide by corresponding
-            // eigenvalues
-            T alpha;
-            T beta = 0;
-            for(int j = 0; j < n; j++)
-            {
-                alpha = T(1) / hDRes[0][j];
-                cpu_symv_hemv(rocblas_fill_upper, n, alpha, hA[0], lda, hCRes[0] + j * ldc, 1, beta,
-                              hC[0] + j * ldc, 1);
-            }
+            /* // multiply A with each of the n eigenvectors and divide by corresponding */
+            /* // eigenvalues */
+            /* T alpha; */
+            /* T beta = 0; */
+            /* for(int j = 0; j < n; j++) */
+            /* { */
+            /*     alpha = T(1) / hDRes[0][j]; */
+            /*     cpu_symv_hemv(rocblas_fill_upper, n, alpha, hA[0], lda, hCRes[0] + j * ldc, 1, beta, */
+            /*                   hC[0] + j * ldc, 1); */
+            /* } */
 
-            // error is ||hC - hCRes|| / ||hC||
-            // using frobenius norm
-            err = norm_error('F', n, n, ldc, hC[0], hCRes[0]);
-            *max_err = err > *max_err ? err : *max_err;
+            /* // error is ||hC - hCRes|| / ||hC|| */
+            /* // using frobenius norm */
+            /* err = norm_error('F', n, n, ldc, hC[0], hCRes[0]); */
+            /* *max_err = err > *max_err ? err : *max_err; */
+
+            // Input matrix
+            auto M = HMat::Wrap(hA[0], lda, n)->block(BDesc().nrows(n).ncols(n));
+            std::cout << "::: Input matrix: " << std::endl;
+            /* std::cout << "M^* - M = " << (adjoint(M) - M).max_coeff_norm() << std::endl; */
+            M.print();
+
+            // Computed eigenvectors
+            auto U = HMat::Wrap(hCRes[0], ldc, n)->block(BDesc().nrows(n).ncols(n));
+            // Computed eigenvalues
+            auto d = HMat::Convert(hDRes[0], 1, n)->block(BDesc().nrows(1).ncols(n));
+            // Diagonal matrix of size n by n with computed eigenvalues
+            auto D = HMat::Zeros(n, n).diag(d);
+
+            // Orthogonal error
+            auto OE = U * adjoint(U) - HMat::Eye(n, n);
+            err = OE.max_col_norm();
+            *max_errv = err > *max_errv ? err : *max_errv;
+
+            // Residual error
+            auto RE = M - U * D * adjoint(U);
+            err = RE.norm() / M.norm();
+            /* std::cout << "######################### Error matrix #############################" << std::endl; */
+            /* RE.print(); */
+            *max_errr = err > *max_errr ? err : *max_errr;
         }
     }
 }
@@ -363,6 +460,7 @@ void testing_steqr(Arguments& argus)
     size_t size_E = n;
     size_t size_C = ldc * n;
     double max_error = 0, gpu_time_used = 0, cpu_time_used = 0;
+    double max_errorv = 0, max_errorr = 0;
 
     size_t size_DRes = (argus.unit_check || argus.norm_check) ? size_D : 0;
     size_t size_ERes = (argus.unit_check || argus.norm_check) ? size_E : 0;
@@ -432,7 +530,7 @@ void testing_steqr(Arguments& argus)
     // check computations
     if(argus.unit_check || argus.norm_check)
         steqr_getError<T>(handle, evect, n, dD, dE, dC, ldc, dInfo, hD, hDRes, hE, hERes, hC, hCRes,
-                          hInfo, hInfoRes, &max_error);
+                          hInfo, hInfoRes, &max_error, &max_errorv, &max_errorr);
 
     // collect performance data
     if(argus.timing && hot_calls > 0)
@@ -443,7 +541,11 @@ void testing_steqr(Arguments& argus)
     // validate results for rocsolver-test
     // using n * machine_precision as tolerance
     if(argus.unit_check)
+    {
         ROCSOLVER_TEST_CHECK(T, max_error, n);
+        ROCSOLVER_TEST_CHECK(T, max_errorv, n);
+        ROCSOLVER_TEST_CHECK(T, max_errorr, n);
+    }
 
     // output results for rocsolver-bench
     if(argus.timing)
