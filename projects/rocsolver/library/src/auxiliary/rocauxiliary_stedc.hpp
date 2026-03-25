@@ -4,7 +4,7 @@
  *     Univ. of Tennessee, Univ. of California Berkeley,
  *     Univ. of Colorado Denver and NAG Ltd..
  *     December 2016
- * Copyright (C) 2021-2025 Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) 2021-2026 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -500,14 +500,14 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
         {
             S val = C[p2 - 1 + (p1 + i) * ldc] / sqrt(2);
             z[p1 + i] = val;
-            maxz = std::max(maxz, std::abs(val));
+            maxz = std::max(maxz, std::abs(p * val));
         }
         // copy first line of the second sub-block
         for(int i = hipThreadIdx_x; i < sz2; i += hipBlockDim_x)
         {
             S val = C[p2 - 0 + (p2 + i) * ldc] / sqrt(2);
             z[p2 + i] = val;
-            maxz = std::max(maxz, std::abs(val));
+            maxz = std::max(maxz, std::abs(p * val));
         }
 
         // 2. calculate deflation tolerance
