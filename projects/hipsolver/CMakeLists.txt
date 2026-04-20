@@ -81,7 +81,7 @@ option(BUILD_HIPSPARSE_TESTS "Build additional tests to cover sparse functionali
 # BUILD_SHARED_LIBS is a cmake built-in; we make it an explicit option such that it shows in cmake-gui
 option(BUILD_WITH_SPARSE "Build hipSOLVER with sparse functionality available at build time (requires installed dependencies)" OFF)
 option(BUILD_VERBOSE "Output additional build information" OFF)
-option(HIPSOLVER_FIND_PACKAGE_LAPACK_CONFIG "Skip module mode search for LAPACK" ON)
+option(HIPSOLVER_FIND_PACKAGE_LAPACK_CONFIG "Skip module mode search for LAPACK" OFF)
 option(BUILD_FORTRAN_BINDINGS "Build the Fortran bindings" "${UNIX}")
 
 if(NOT BUILD_SHARED_LIBS)
@@ -144,26 +144,72 @@ if(HIP_PLATFORM STREQUAL nvidia)
 endif()
 
 if(NOT "${HIP_PLATFORM}" STREQUAL "nvidia")
-  # TODO: This LAPACK dependency is only required to support geev
-  # It should be removed once geev is implemented in rocSOLVER
+    # TODO: This LAPACK dependency is only required to support geev
+    # It should be removed once geev is implemented in rocSOLVER
+    option(HIPSOLVER_INTERNAL_LAPACK_BUILD "Link to a locally built, static, OpenBLAS library -- required to support geev, will be removed once geev is implemented in rocSOLVER" ON)
+    if(HIPSOLVER_INTERNAL_LAPACK_BUILD)
+        include(FetchContent)
+        function(make_available REPOSITORY_URL BRANCH_NAME THIS_PROJECT_NAME THIS_SOURCE_DIR)
+            message(STATUS "Cloning ${REPOSITORY_URL} into ${THIS_SOURCE_DIR}")
+            FetchContent_Declare(
+                "${THIS_PROJECT_NAME}"
+                GIT_REPOSITORY "${REPOSITORY_URL}"
+                SOURCE_DIR "${THIS_SOURCE_DIR}"
+                GIT_TAG "origin/${BRANCH_NAME}"
+                CONFIGURE_COMMAND
+                BUILD_COMMAND
+                INSTALL_COMMAND
+                FIND_PACKAGE_ARGS
+            )
+            FetchContent_MakeAvailable(${THIS_PROJECT_NAME})
+        endfunction(make_available)
 
-  # Some CPU side functionality is provided by external lapack
-  # Linking lapack library requires fortran flags
-  set(THREADS_PREFER_PTHREAD_FLAG ON)
-  find_package(Threads REQUIRED)
-  if(HIPSOLVER_FIND_PACKAGE_LAPACK_CONFIG)
-    find_package(LAPACK 3.7 REQUIRED CONFIG)
-  else()
-    find_package(LAPACK 3.7 REQUIRED)
-  endif()
+        # Sets variables to fine-tune OpenBLAS' build
+        # No Fortran
+        set(C_LAPACK ON CACHE BOOL "" FORCE)
+        set(NOFORTRAN ON CACHE BOOL "" FORCE)
+        # Build a static library
+        set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+        set(BUILD_LAPACK_DEPRECATED OFF CACHE BOOL "" FORCE)
+        set(BUILD_BENCHMARKS OFF CACHE BOOL "")
+        # No multi-threading
+        set(USE_OPENMP OFF CACHE BOOL "" FORCE)
+        set(USE_THREAD OFF CACHE BOOL "" FORCE)
+        # Call CMake's FetchContent
+        make_available("https://github.com/OpenMathLib/OpenBLAS" "develop" "hipsolver-static-lapack" "${CMAKE_CURRENT_BINARY_DIR}/lapack")
 
-  if(NOT LAPACK_LIBRARIES)
-    message("Using manually specified LAPACK")
-    set(LAPACK_LIBRARIES
-      ${LAPACK_blas_LIBRARIES}
-      ${LAPACK_lapack_LIBRARIES}
-    )
-  endif()
+        if(NOT TARGET lapack_libraries)
+            add_library(lapack_libraries INTERFACE)
+            if(TARGET openblas)
+                target_link_libraries(lapack_libraries INTERFACE openblas)
+            endif()
+            if(TARGET blas)
+                target_link_libraries(lapack_libraries INTERFACE blas)
+            endif()
+            if(TARGET lapack)
+                target_link_libraries(lapack_libraries INTERFACE lapack)
+            endif()
+        endif()
+    else()
+        # Some CPU side functionality is provided by external lapack
+        # Linking lapack library requires fortran flags
+        set(THREADS_PREFER_PTHREAD_FLAG ON)
+        find_package(Threads REQUIRED)
+        if(HIPSOLVER_FIND_PACKAGE_LAPACK_CONFIG)
+            find_package(LAPACK 3.7 REQUIRED CONFIG)
+        else()
+            find_package(LAPACK 3.7 REQUIRED)
+        endif()
+
+        if(NOT TARGET lapack_libraries)
+            add_library(lapack_libraries INTERFACE)
+            message("Using manually specified LAPACK")
+            target_link_libraries(lapack_libraries INTERFACE
+                ${LAPACK_blas_LIBRARIES}
+                ${LAPACK_lapack_LIBRARIES}
+            )
+        endif()
+    endif()
 endif()
 
 
