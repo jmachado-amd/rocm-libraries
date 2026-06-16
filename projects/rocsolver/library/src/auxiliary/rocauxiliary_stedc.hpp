@@ -84,7 +84,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
         S* E = EE + bid * strideE;
 
         // temporary arrays in global memory
-        rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+        rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
         rocblas_int* ns = ps + blks;
 
         // find sizes of sub-blocks
@@ -177,7 +177,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM_SOLVE)
     rocblas_int* info = iinfo + bid;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     S* W = WA + bid * (2 * n);
 
     // Solve the blks sub-blocks in parallel (using classic QR iteration).
@@ -228,7 +228,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     S* D = DD + bid * strideD;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* idd1 = ps + 2 * blks;
     rocblas_int* bp = idd1 + 4 * n;
     S* z1 = workSvec + bid * (std::max(7, n) * n);
@@ -302,7 +302,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     S* E = EE + bid * strideE;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* nrs = ps + blks;
     rocblas_int* idd1 = nrs + blks;
     rocblas_int* idd2 = idd1 + n;
@@ -576,6 +576,51 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
           to cover the n values of the matrix.
         - Each thread will deal with one value.
         - Size of groups is set to STEDC_BDIM_VALUES.**/
+
+// Phase 1: compute 'count' for each element (reads dcount only) and stash in workInt.
+template <typename S>
+ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
+    stedc_mergeDeflateCount_kernel(const rocblas_int levs,
+                                   const rocblas_int blks,
+                                   const rocblas_int k,
+                                   const rocblas_int n,
+                                   rocblas_int* workInt)
+{
+    rocblas_int bid = hipBlockIdx_y;
+    rocblas_int gid = hipBlockIdx_x;
+    rocblas_int nofg = hipGridDim_x;
+    rocblas_int dim = hipBlockDim_x;
+    rocblas_int totdim = nofg * dim;
+    rocblas_int tid = gid * dim + hipThreadIdx_x;
+
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
+    rocblas_int* nrs = ps + blks;
+    rocblas_int* idd1 = nrs + blks;
+    rocblas_int* bp = idd1 + 4 * n;
+    rocblas_int* dcount = idd1 + 2 * n;
+    rocblas_int* cnt = bp + n;
+
+    for(auto tx = tid; tx < n; tx += totdim)
+    {
+        rocblas_int dm = 1 << k;
+        rocblas_int dm2 = dm << 1;
+
+        rocblas_int bx = bp[tx];
+        rocblas_int in = ps[bx];
+
+        // 'count' is the number of non-deflated values until value 'tx'
+        rocblas_int count = (bx % dm2 == 0) ? 0 : nrs[bx - 1];
+        rocblas_int j = tx - in;
+        for(auto i = 0; i < j; ++i)
+        {
+            if(dcount[in + i] > 0)
+                count++;
+        }
+        cnt[tx] = count;
+    }
+}
+
+// Phase 2: use 'count' computed by stedc_mergeDeflateCount_kernel to perform deflations.
 template <typename S>
 ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM) stedc_mergeDeflate_kernel(const rocblas_int levs,
                                                                               const rocblas_int blks,
@@ -594,13 +639,14 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM) stedc_mergeDeflate_kernel(co
     rocblas_int tid = gid * dim + hipThreadIdx_x;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* nrs = ps + blks;
     rocblas_int* idd1 = nrs + blks;
     rocblas_int* idd2 = idd1 + n;
     rocblas_int* bp = idd1 + 4 * n;
     rocblas_int* dcount = idd2 + n;
     rocblas_int* rmap = dcount + n;
+    rocblas_int* cnt = bp + n;
     S* z1 = workSvec + bid * (std::max(7, n) * n);
     S* z2 = z1 + n;
     S* ev1 = z2 + n;
@@ -609,7 +655,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM) stedc_mergeDeflate_kernel(co
     S* c = ev3 + n;
     S* s = c + n;
 
-    // work with all the values (items) in parallel
+    // count was computed by stedc_mergeDeflateCount_kernel and stored in cnt
     for(auto tx = tid; tx < n; tx += totdim)
     {
         rocblas_int dm = 1 << k;
@@ -631,14 +677,8 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM) stedc_mergeDeflate_kernel(co
         rocblas_int out = tmp < blks ? ps[tmp] : n;
 
         // 'count' is the number of non-deflated values until value 'tx'
-        rocblas_int count = (bx % dm2 == 0) ? 0 : nrs[bx - 1];
+        rocblas_int count = cnt[tx];
         rocblas_int pj = tx - pin;
-        rocblas_int j = tx - in;
-        for(auto i = 0; i < j; ++i)
-        {
-            if(dcount[in + i] > 0)
-                count++;
-        }
 
         rocblas_int map = idd1[tx];
         S vald = ev1[tx];
@@ -653,7 +693,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM) stedc_mergeDeflate_kernel(co
             idd2[idx] = map;
         }
 
-        // otehrwise move it to the non-deflated list, and compute rotations to zero out
+        // otherwise move it to the non-deflated list, and compute rotations to zero out
         // the corresponding z element when required
         else
         {
@@ -719,7 +759,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     S* E = EE + bid * strideE;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* nrs = ps + blks;
     rocblas_int* bp = ps + 2 * blks + 4 * n;
     S* z1 = workSvec + bid * (std::max(7, n) * n);
@@ -794,7 +834,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     S* C = load_ptr_batch<S>(CC, bid, shiftC, strideC);
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* idd1 = ps + 2 * blks;
     rocblas_int* dcount = idd1 + 2 * n;
     rocblas_int* rmap = dcount + n;
@@ -902,7 +942,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM_VALUES)
     S* E = EE + bid * strideE;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* nrs = ps + blks;
     rocblas_int* idd2 = nrs + blks + n;
     rocblas_int* bp = ps + 2 * blks + 4 * n;
@@ -984,7 +1024,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     S* E = EE + bid * strideE;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* nrs = ps + blks;
     rocblas_int* idd1 = nrs + blks;
     rocblas_int* idd2 = idd1 + n;
@@ -1062,7 +1102,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     S* E = EE + bid * strideE;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* nrs = ps + blks;
     rocblas_int* bp = ps + 2 * blks + 4 * n;
     S* z1 = workSvec + bid * (std::max(7, n) * n);
@@ -1159,7 +1199,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     S* E = EE + bid * strideE;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* nrs = ps + blks;
     rocblas_int* idd2 = nrs + blks + n;
     rocblas_int* bp = ps + 2 * blks + 4 * n;
@@ -1250,7 +1290,7 @@ __launch_bounds__(STEDC_BDIM) ROCSOLVER_KERNEL
     rocblas_int tid = hipThreadIdx_x;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* idd1 = ps + 2 * blks;
     rocblas_int* bp = ps + 2 * blks + 4 * n;
     S* temps = workStmp + bid * (n * n);
@@ -1307,7 +1347,7 @@ __launch_bounds__(STEDC_BDIM) ROCSOLVER_KERNEL
     S* E = EE + bid * strideE;
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* nrs = ps + blks;
     rocblas_int* idd1 = nrs + blks;
     rocblas_int* idd2 = idd1 + n;
@@ -1383,7 +1423,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     S* W = workSvec + bid * (n * n);
 
     // temporary arrays in global memory
-    rocblas_int* ps = workInt + bid * (5 * n + 2 * blks);
+    rocblas_int* ps = workInt + bid * (6 * n + 2 * blks);
     rocblas_int* bp = ps + 2 * blks + 4 * n;
 
     rocblas_int dm = 1 << k;
@@ -1516,7 +1556,7 @@ void rocsolver_stedc_getMemorySize(const rocblas_evect evect,
 
         *size_workStmp = sizeof(S) * (n * n) * batch_count;
 
-        *size_workInt = sizeof(rocblas_int) * (5 * n + 2 * blks) * batch_count;
+        *size_workInt = sizeof(rocblas_int) * (6 * n + 2 * blks) * batch_count;
 
         *size_workSz = sizeof(S) * (n)*batch_count;
     }
@@ -1720,6 +1760,8 @@ rocblas_status rocsolver_stedc_template(rocblas_handle handle,
                                     dim3(STEDC_BDIM), lmemsize, stream, levs, blks, k, n,
                                     E + shiftE, strideE, workSvecs, workInt, eps);
 
+            ROCSOLVER_LAUNCH_KERNEL((stedc_mergeDeflateCount_kernel<S>), dim3(numgrps, batch_count),
+                                    dim3(STEDC_BDIM), 0, stream, levs, blks, k, n, workInt);
             ROCSOLVER_LAUNCH_KERNEL((stedc_mergeDeflate_kernel<S>), dim3(numgrps, batch_count),
                                     dim3(STEDC_BDIM), 0, stream, levs, blks, k, n, workSvecs,
                                     workInt, eps);
