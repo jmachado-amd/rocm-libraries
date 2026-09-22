@@ -46,6 +46,13 @@
 #include "rocsolver_device_workspace.hpp"
 #include <rocprofiler-sdk-roctx/roctx.h>
 
+// Register-buffering chunk size for the fused-kernel GEMV/SYMV/AXPY loads (load CHUNK_SIZE
+// independent global loads into registers before the FMAs to hide load latency). Overridable
+// at build time via -DLATRD_SYMV_CHUNK_SIZE=N.
+#ifndef LATRD_SYMV_CHUNK_SIZE
+#define LATRD_SYMV_CHUNK_SIZE 4
+#endif
+
 static bool print_debug_messages_latrd_forsytrd
     = std::getenv("PRINT_DEBUG") != nullptr ? true : false;
 
@@ -3078,8 +3085,28 @@ __global__ void __launch_bounds__(MAX_THDS) latrd_lower_kernel_fused(const I n,
         for(I ii = bid; ii < nj; ii += gridDim.x)
         {
             temp = T(0);
-            for(I jj = tid; jj < nj; jj += MAX_THDS)
-                temp += Atmp[jj + (rocblas_stride)ii * ldSA] * v[jj];
+            const rocblas_stride col = (rocblas_stride)ii * ldSA;
+            // Buffered reads: issue CHUNK_SIZE independent global loads into registers before
+            // the FMAs so multiple loads are in flight at once (ILP hides load latency on this
+            // otherwise latency-bound coalesced dot product; wins past the L2 cliff, n>1024).
+            constexpr I CHUNK_SIZE = LATRD_SYMV_CHUNK_SIZE;
+            const I step = (I)MAX_THDS;
+            I jj = tid;
+            for(; jj + (CHUNK_SIZE - 1) * step < nj; jj += CHUNK_SIZE * step)
+            {
+                T a[CHUNK_SIZE], vv[CHUNK_SIZE];
+#pragma unroll
+                for(I u = 0; u < CHUNK_SIZE; ++u)
+                {
+                    a[u] = Atmp[jj + u * step + col];
+                    vv[u] = v[jj + u * step];
+                }
+#pragma unroll
+                for(I u = 0; u < CHUNK_SIZE; ++u)
+                    temp += a[u] * vv[u];
+            }
+            for(; jj < nj; jj += step)
+                temp += Atmp[jj + col] * v[jj];
             reduce_block_sum(temp, pSmem);
             if(tid == warpSize - 1)
                 w[j + 1 + ii] = temp;
@@ -3117,15 +3144,39 @@ __global__ void __launch_bounds__(MAX_THDS) latrd_lower_kernel_fused(const I n,
         {
             // Steps 5 & 7 merged: one pass over columns jj computes both z1 (from W) and z2
             // (from A), reading v[ii] once instead of twice and collapsing two grid-strided
-            // loops (each with its own reduction + barrier) into one.
+            // loops (each with its own reduction + barrier) into one. Inner row reduction is
+            // buffered (CHUNK_SIZE loads in flight) as in Part C; smaller win here (only j<=nb
+            // columns vs nj in Part C).
+            constexpr I CHUNK_SIZE_Z = LATRD_SYMV_CHUNK_SIZE;
+            const I step_z = (I)MAX_THDS;
             for(I jj = bid; jj < j; jj += gridDim.x)
             {
                 T s1 = T(0), s2 = T(0);
-                for(I ii = tid; ii < nj; ii += MAX_THDS)
+                const rocblas_stride cw = (rocblas_stride)jj * ldSW;
+                const rocblas_stride ca = (rocblas_stride)jj * ldSA;
+                I ii = tid;
+                for(; ii + (CHUNK_SIZE_Z - 1) * step_z < nj; ii += CHUNK_SIZE_Z * step_z)
+                {
+                    T wv[CHUNK_SIZE_Z], av[CHUNK_SIZE_Z], vv[CHUNK_SIZE_Z];
+#pragma unroll
+                    for(I u = 0; u < CHUNK_SIZE_Z; ++u)
+                    {
+                        wv[u] = Wtmp[ii + u * step_z + cw];
+                        av[u] = Atmp[ii + u * step_z + ca];
+                        vv[u] = v[ii + u * step_z];
+                    }
+#pragma unroll
+                    for(I u = 0; u < CHUNK_SIZE_Z; ++u)
+                    {
+                        s1 += wv[u] * vv[u];
+                        s2 += av[u] * vv[u];
+                    }
+                }
+                for(; ii < nj; ii += step_z)
                 {
                     T vi = v[ii];
-                    s1 += Wtmp[ii + jj * ldSW] * vi;
-                    s2 += Atmp[ii + jj * ldSA] * vi;
+                    s1 += Wtmp[ii + cw] * vi;
+                    s2 += Atmp[ii + ca] * vi;
                 }
                 reduce_block_sum(s1, s2, pSmem);
                 if(tid == warpSize - 1)
@@ -3196,20 +3247,58 @@ __global__ void __launch_bounds__(MAX_THDS) latrd_lower_kernel_fused(const I n,
         //
         if(bid == 0)
         {
-            // Accumulate dot product <v, w>; read v from global directly (coalesced).
+            // Part E runs on block 0 only, but the whole grid waits on it at the next sync, so
+            // speeding block 0's two nj-length loops shortens the stall for every block.
+            constexpr I CHUNK_SIZE_E = LATRD_SYMV_CHUNK_SIZE;
+            const I step_e = (I)MAX_THDS;
+
+            // Accumulate dot product <v, w>; buffered reads (v and w in flight together).
             temp = T(0);
-            for(I ii = tid; ii < nj; ii += MAX_THDS)
-                temp += v[ii] * conj(w[ii + j + 1]);
+            const T* wE = w + j + 1;
+            {
+                I ii = tid;
+                for(; ii + (CHUNK_SIZE_E - 1) * step_e < nj; ii += CHUNK_SIZE_E * step_e)
+                {
+                    T vv[CHUNK_SIZE_E], wv[CHUNK_SIZE_E];
+#pragma unroll
+                    for(I u = 0; u < CHUNK_SIZE_E; ++u)
+                    {
+                        vv[u] = v[ii + u * step_e];
+                        wv[u] = wE[ii + u * step_e];
+                    }
+#pragma unroll
+                    for(I u = 0; u < CHUNK_SIZE_E; ++u)
+                        temp += vv[u] * conj(wv[u]);
+                }
+                for(; ii < nj; ii += step_e)
+                    temp += v[ii] * conj(wE[ii]);
+            }
             reduce_block_sum(temp, pSmem);
 
             if(tid == warpSize - 1)
                 pSmem[0] = -0.5 * tau_j[0] * tau_j[0] * temp; // alpha
             __syncthreads();
 
-            // AXPY: read v and w from global.
+            // AXPY: buffered reads (v and w in flight together), then elementwise write.
             T alpha = pSmem[0];
-            for(I ii = tid; ii < nj; ii += MAX_THDS)
-                pW[(j + 1 + ii) + j * ldSW] = alpha * v[ii] + tau_j[0] * w[ii + j + 1];
+            {
+                I ii = tid;
+                for(; ii + (CHUNK_SIZE_E - 1) * step_e < nj; ii += CHUNK_SIZE_E * step_e)
+                {
+                    T vv[CHUNK_SIZE_E], wv[CHUNK_SIZE_E];
+#pragma unroll
+                    for(I u = 0; u < CHUNK_SIZE_E; ++u)
+                    {
+                        vv[u] = v[ii + u * step_e];
+                        wv[u] = wE[ii + u * step_e];
+                    }
+#pragma unroll
+                    for(I u = 0; u < CHUNK_SIZE_E; ++u)
+                        pW[(j + 1 + ii + u * step_e) + j * ldSW] = alpha * vv[u] + tau_j[0] * wv[u];
+                }
+                for(; ii < nj; ii += step_e)
+                    pW[(j + 1 + ii) + j * ldSW] = alpha * v[ii] + tau_j[0] * wE[ii];
+            }
         }
         // This grid sync only protects the NEXT iteration's Part A reads of A/W from this
         // iteration's Part E writes. On the final iteration there is no next iteration, so it
