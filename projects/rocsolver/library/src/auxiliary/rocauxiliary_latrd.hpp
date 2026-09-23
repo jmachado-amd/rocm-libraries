@@ -46,6 +46,14 @@
 #include "rocsolver_device_workspace.hpp"
 #include <rocprofiler-sdk-roctx/roctx.h>
 
+// SQTT markers to locate the SYMV loop in ISA.
+// Keep SQTT_ENABLED 0 for TIMING/verify builds (markers add s_ttracedata + sched_barriers in the
+// hot loop and skew results); flip to 1 only for an ISA-inspection build.
+#define SQTT_ENABLED 1
+#include "/opt/rocm/core-10.0/include/rocprof-trace-decoder/rocprof_trace_decoder/cxx/markers.hpp"
+// EXPERIMENTAL float4 wide-load SYMV Step-4 (default off; local A/B only).
+#define LATRD_SYMV_F4 0
+
 // Register-buffering chunk size for the fused-kernel GEMV/SYMV/AXPY loads (load CHUNK_SIZE
 // independent global loads into registers before the FMAs to hide load latency). Overridable
 // at build time via -DLATRD_SYMV_CHUNK_SIZE=N.
@@ -3091,7 +3099,39 @@ __global__ void __launch_bounds__(MAX_THDS) latrd_lower_kernel_fused(const I n,
             // otherwise latency-bound coalesced dot product; wins past the L2 cliff, n>1024).
             constexpr I CHUNK_SIZE = LATRD_SYMV_CHUNK_SIZE;
             const I step = (I)MAX_THDS;
+#if defined(LATRD_SYMV_F4) && LATRD_SYMV_F4
+            // EXPERIMENTAL: wide coalesced float4 loads of A (aligned via uniform row peel).
+            // Requires ldSA % 4 == 0 (holds when lda=n and n%4==0). The dot-product walks DOWN
+            // column ii starting at row (j+1); base element offset = (j+1)+(j+1+ii)*ldSA, whose
+            // %4 residue (with ldSA%4==0) depends ONLY on (j+1) -> uniform peel across threads/ii.
+            // v stays scalar (contiguous, cache-resident, reused across all output rows ii).
+            if constexpr(std::is_same<T, float>::value)
+            {
+                const float* Acol = (const float*)(Atmp + col); // row 0 of this column's dot product
+                const float* vrow = (const float*)v;
+                const I p = (I)((4 - ((rocblas_stride)(j + 1) & 3)) & 3); // rows to peel for 16B align
+                sqtt_marker_enter(2u); // LOCAL PROFILING: f4 peel + vector body ENTER (id=2)
+                I r = tid;
+                for(; r < p && r < nj; r += step) // uniform scalar peel (<=3 rows)
+                    temp += Acol[r] * vrow[r];
+                r = p + 4 * tid;
+                for(; r + 3 < nj; r += 4 * step)
+                {
+                    float4 a4 = *(const float4*)(Acol + r); // aligned global_load_dwordx4
+                    temp += a4.x * vrow[r] + a4.y * vrow[r + 1] + a4.z * vrow[r + 2]
+                            + a4.w * vrow[r + 3];
+                }
+                sqtt_marker_exit(2u); // LOCAL PROFILING: f4 vector body EXIT
+                sqtt_marker_enter(3u); // LOCAL PROFILING: f4 straddle tail ENTER (id=3)
+                for(I m = 0; m < 4 && r + m < nj; ++m) // this thread's straddling 4-group tail
+                    temp += Acol[r + m] * vrow[r + m];
+                sqtt_marker_exit(3u); // LOCAL PROFILING: f4 straddle tail EXIT
+            }
+            else
+#endif
+            {
             I jj = tid;
+            sqtt_marker_enter(2u); // LOCAL PROFILING: buffered SYMV main (chunked) loop ENTER (id=2)
             for(; jj + (CHUNK_SIZE - 1) * step < nj; jj += CHUNK_SIZE * step)
             {
                 T a[CHUNK_SIZE], vv[CHUNK_SIZE];
@@ -3105,8 +3145,12 @@ __global__ void __launch_bounds__(MAX_THDS) latrd_lower_kernel_fused(const I n,
                 for(I u = 0; u < CHUNK_SIZE; ++u)
                     temp += a[u] * vv[u];
             }
+            sqtt_marker_exit(2u); // LOCAL PROFILING: buffered SYMV main loop EXIT
+            sqtt_marker_enter(3u); // LOCAL PROFILING: buffered SYMV remainder loop ENTER (id=3)
             for(; jj < nj; jj += step)
                 temp += Atmp[jj + col] * v[jj];
+            sqtt_marker_exit(3u); // LOCAL PROFILING: buffered SYMV remainder loop EXIT
+            }
             reduce_block_sum(temp, pSmem);
             if(tid == warpSize - 1)
                 w[j + 1 + ii] = temp;
