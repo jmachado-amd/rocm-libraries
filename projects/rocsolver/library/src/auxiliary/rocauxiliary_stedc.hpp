@@ -682,6 +682,13 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     // than in the input, but the following computations are doomed anyway.
     if(nan)
     {
+        //=== TEMPORARY INSTRUMENTATION (REVERT BEFORE MERGE) ================
+        // A NaN makes every ordering comparison false, so lt/eq collapse and
+        // many gids compute the same rank 'pos' -> they overwrite one slot and
+        // leave the rest of ndd[p1 .. p1+sz) unwritten.
+        printf("STEDC_SORTD_NAN k=%d bid=%d gid=%d n=%d sz=%d p1=%d pos=%d\n", (int)k, (int)bid,
+               (int)gid, (int)n, (int)sz, (int)p1, (int)pos);
+        //=== END TEMPORARY INSTRUMENTATION ==================================
         md[gid] = NAN;
     }
 }
@@ -1130,6 +1137,21 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     }
 }
 
+//=== TEMPORARY INSTRUMENTATION (REVERT BEFORE MERGE) ========================
+/** Stamps every ndd slot ONCE, before the merge loop, so that a slot never
+    written by ANY level is distinguishable from one holding a valid (possibly
+    stale) count written at an earlier level. All six ndd consumers guard with
+    "eid - p1 < dd", which is false for -1, so the stamp is inert. **/
+template <typename I>
+ROCSOLVER_KERNEL void stedc_dbg_ndd_stamp(const I n, I* splitsA, const I val)
+{
+    I bid = hipBlockIdx_y;
+    I* ndd = ptr_ndd(n, splitsA + bid * get_splits_size(n));
+    for(I i = hipThreadIdx_x; i < n; i += hipBlockDim_x)
+        ndd[i] = val;
+}
+//=== END TEMPORARY INSTRUMENTATION ==========================================
+
 template <typename S, typename I>
 ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
     stedc_mergeValues_copyD_kernel(const I k,
@@ -1161,6 +1183,17 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
 
     I dd = ndd[eid];
     I p1 = nps[eid];
+
+    //=== TEMPORARY INSTRUMENTATION (REVERT BEFORE MERGE) ====================
+    // dd is a count of non-deflated entries within a block, so a WRITTEN slot
+    // always satisfies 0 <= dd <= sz <= n. Anything else means copyD is reading
+    // a slot no level ever wrote (-1 = our stamp; any other out-of-range value
+    // = raw uninitialized workspace), which is what drives the OOB in
+    // etmpd[eid*n+i] / cd[p1+i].
+    if(hipThreadIdx_x == 0 && (dd < 0 || dd > n || p1 < 0 || p1 + dd > n))
+        printf("STEDC_COPYD_BAD k=%d bid=%d eid=%d n=%d dd=%d p1=%d\n", (int)k, (int)bid, (int)eid,
+               (int)n, (int)dd, (int)p1);
+    //=== END TEMPORARY INSTRUMENTATION ======================================
 
     // copy sorted values back to D
     I x = hipThreadIdx_x + hipBlockDim_x * hipBlockIdx_x;
@@ -2001,6 +2034,24 @@ rocblas_status rocsolver_stedc_template(rocblas_handle handle,
             ldv = (I)(sizeof(T) / sizeof(S)) * ldc;
             strideV = (I)(sizeof(T) / sizeof(S)) * strideC;
         }
+        //=== TEMPORARY INSTRUMENTATION (REVERT BEFORE MERGE) ================
+        // ROCSOLVER_DBG_NDD_DIRTY=<int>: simulate a recycled workspace arriving
+        // with hostile contents, BEFORE the candidate fix runs. Models what the
+        // rocBLAS device pool actually hands to syevdx/sygvdx/stedcx (which,
+        // unlike syevd, never pre-zero `splits`).
+        if(const char* d = std::getenv("ROCSOLVER_DBG_NDD_DIRTY"))
+            ROCSOLVER_LAUNCH_KERNEL((stedc_dbg_ndd_stamp<I>), dim3(1, batch_count),
+                                    dim3(STEDC_BDIM), (I)0, stream, n, splits,
+                                    (I)std::strtol(d, nullptr, 10));
+
+        // CANDIDATE FIX (ROCSOLVER_FIX_ZERO_SPLITS=1): make stedc_template
+        // self-contained by zeroing `splits` itself, instead of relying on an
+        // undocumented "caller must pre-zero" precondition that only syevd honours.
+        if(std::getenv("ROCSOLVER_FIX_ZERO_SPLITS") != nullptr)
+            HIP_CHECK(hipMemsetAsync((void*)splits, 0,
+                                     sizeof(I) * get_splits_size(n) * batch_count, stream));
+        //=== END TEMPORARY INSTRUMENTATION ==================================
+
         I groupsn = (n - 1) / BS2 + 1;
         ROCSOLVER_LAUNCH_KERNEL(init_ident<S>, dim3(groupsn, groupsn, batch_count), dim3(BS2, BS2),
                                 0, stream, n, n, V, 0, ldv, strideV);
@@ -2017,6 +2068,19 @@ rocblas_status rocsolver_stedc_template(rocblas_handle handle,
         ROCSOLVER_LAUNCH_KERNEL((stedc_solve_kernel<S>), dim3(blks, batch_count), dim3(64), (I)0,
                                 stream, levs, n, D + shiftD, strideD, E + shiftE, strideE, V, (I)0,
                                 ldv, strideV, info, (S*)work_stack, splits, eps, ssfmin, ssfmax);
+
+        //=== TEMPORARY INSTRUMENTATION (REVERT BEFORE MERGE) ================
+        // Stamp ndd ONCE (not per level) so "never written by any level" is
+        // distinguishable from "not written at this level" (which legitimately
+        // retains an earlier level's valid count).
+        // ROCSOLVER_DBG_NDD_STAMP=<int>: pre-fill every ndd slot with <int> before
+        // the merge loop. -1 proves "never written by any level"; a large value
+        // simulates hostile recycled workspace. Unset = observe real memory.
+        if(const char* s = std::getenv("ROCSOLVER_DBG_NDD_STAMP"))
+            ROCSOLVER_LAUNCH_KERNEL((stedc_dbg_ndd_stamp<I>), dim3(1, batch_count),
+                                    dim3(STEDC_BDIM), (I)0, stream, n, splits,
+                                    (I)std::strtol(s, nullptr, 10));
+        //=== END TEMPORARY INSTRUMENTATION ==================================
 
         // 3. merge phase
         //----------------

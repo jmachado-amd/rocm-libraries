@@ -36,6 +36,44 @@
 
 ROCSOLVER_BEGIN_NAMESPACE
 
+//=== TEMPORARY INSTRUMENTATION (REVERT BEFORE MERGE) ========================
+/** Scans an n x n matrix (per batch instance) for NaN and prints the stage tag
+    and batch id when found. Used to find the FIRST point in the sygvdx/hegvdx
+    pipeline (potrf -> sygst/hegst -> syevdx/heevdx -> sytrd -> stedc) where a
+    NaN appears, for a matrix with indefinite B (singular=1 test cases). **/
+template <typename T, typename I, typename U>
+ROCSOLVER_KERNEL void rocsolver_dbg_scan_nan(const int stage,
+                                             const I n,
+                                             U MM,
+                                             const rocblas_stride shiftM,
+                                             const I ldm,
+                                             const rocblas_stride strideM,
+                                             const I batch_count)
+{
+    I bid = hipBlockIdx_x;
+    if(bid >= batch_count)
+        return;
+    T* M = load_ptr_batch<T>(MM, bid, shiftM, strideM);
+    for(I j = 0; j < n; j++)
+    {
+        for(I i = 0; i < n; i++)
+        {
+            auto v = M[i + j * ldm];
+            bool isbad;
+            if constexpr(rocblas_is_complex<T>)
+                isbad = std::isnan(v.real()) || std::isnan(v.imag());
+            else
+                isbad = std::isnan(v);
+            if(isbad)
+            {
+                printf("DBG_NAN_SCAN stage=%d bid=%d i=%d j=%d\n", stage, (int)bid, (int)i, (int)j);
+                return;
+            }
+        }
+    }
+}
+//=== END TEMPORARY INSTRUMENTATION ==========================================
+
 template <typename T, typename S>
 rocblas_status rocsolver_sygvdx_hegvdx_argCheck(rocblas_handle handle,
                                                 const rocblas_eform itype,
@@ -266,6 +304,11 @@ rocblas_status rocsolver_sygvdx_hegvdx_template(rocblas_handle handle,
         handle, uplo, n, B, shiftB, ldb, strideB, info, batch_count, scalars, work1, work2, work3,
         work4, (T*)work7_workArr, iinfo, optim_mem);
 
+    //=== TEMPORARY INSTRUMENTATION (REVERT BEFORE MERGE) ====================
+    ROCSOLVER_LAUNCH_KERNEL((rocsolver_dbg_scan_nan<T>), dim3(batch_count), dim3(1), 0, stream, 0, n,
+                            B, shiftB, ldb, strideB, batch_count);
+    //=== END TEMPORARY INSTRUMENTATION =======================================
+
     /** (TODO: Strictly speaking, computations should stop here if B is not positive definite.
         A should not be modified in this case as no eigenvalues or eigenvectors can be computed.
         Need to find a way to do this efficiently; for now A will be destroyed in the non
@@ -275,6 +318,11 @@ rocblas_status rocsolver_sygvdx_hegvdx_template(rocblas_handle handle,
     rocsolver_sygst_hegst_template<BATCHED, STRIDED, T, S>(
         handle, itype, uplo, n, A, shiftA, lda, strideA, B, shiftB, ldb, strideB, batch_count,
         scalars, work1, work2, work3, work4, optim_mem);
+
+    //=== TEMPORARY INSTRUMENTATION (REVERT BEFORE MERGE) ====================
+    ROCSOLVER_LAUNCH_KERNEL((rocsolver_dbg_scan_nan<T>), dim3(batch_count), dim3(1), 0, stream, 1, n,
+                            A, shiftA, lda, strideA, batch_count);
+    //=== END TEMPORARY INSTRUMENTATION =======================================
 
     rocsolver_syevdx_heevdx_template<BATCHED, STRIDED, T>(
         handle, evect, erange, uplo, n, A, shiftA, lda, strideA, vl, vu, il, iu, nev, W, strideW, Z,
