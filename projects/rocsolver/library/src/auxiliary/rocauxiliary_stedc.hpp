@@ -2044,13 +2044,26 @@ rocblas_status rocsolver_stedc_template(rocblas_handle handle,
                                     dim3(STEDC_BDIM), (I)0, stream, n, splits,
                                     (I)std::strtol(d, nullptr, 10));
 
-        // CANDIDATE FIX (ROCSOLVER_FIX_ZERO_SPLITS=1): make stedc_template
-        // self-contained by zeroing `splits` itself, instead of relying on an
-        // undocumented "caller must pre-zero" precondition that only syevd honours.
-        if(std::getenv("ROCSOLVER_FIX_ZERO_SPLITS") != nullptr)
+        //=== END TEMPORARY INSTRUMENTATION ==================================
+
+        // Zero the `splits` workspace. `ndd` (inside `splits`) is only ever written
+        // at rank positions computed by stedc_mergePrepare_SortD_kernel; if a NaN
+        // reaches the merge, every ordering comparison is false, all ranks collapse
+        // to 0, and the remaining ndd slots are left untouched. copyD then reads
+        // them unguarded, so whatever the workspace happened to contain becomes a
+        // loop bound. Zeroing here makes stedc self-contained rather than relying
+        // on callers to pre-zero: syevd did, but stedcx/syevdx/sygvdx never have.
+        // (Set ROCSOLVER_DISABLE_SPLITS_ZERO=1 to reproduce the original fault.)
+        if(std::getenv("ROCSOLVER_DISABLE_SPLITS_ZERO") == nullptr)
             HIP_CHECK(hipMemsetAsync((void*)splits, 0,
                                      sizeof(I) * get_splits_size(n) * batch_count, stream));
-        //=== END TEMPORARY INSTRUMENTATION ==================================
+
+        // `tmpz` is likewise stedc-exclusive: no caller consumes it before or after
+        // this call, so zeroing it here simply relocates the cost rather than adding
+        // to it. It holds cd/evs/md, which the merge indexes with the same rank
+        // machinery as ndd, so it has the same read-before-write exposure.
+        HIP_CHECK(hipMemsetAsync((void*)tmpz, 0, sizeof(S) * get_tmpz_size(n) * batch_count,
+                                 stream));
 
         I groupsn = (n - 1) / BS2 + 1;
         ROCSOLVER_LAUNCH_KERNEL(init_ident<S>, dim3(groupsn, groupsn, batch_count), dim3(BS2, BS2),

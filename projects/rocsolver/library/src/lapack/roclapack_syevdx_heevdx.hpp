@@ -243,6 +243,36 @@ rocblas_status rocsolver_syevdx_heevdx_template(rocblas_handle handle,
         return rocblas_status_success;
     }
 
+    // Zero the scratch workspace, mirroring rocsolver_syevd_heevd_template.
+    // syevd has always done this; syevdx never did, so every buffer it forwards
+    // to stedcx/stedc arrived holding whatever the rocBLAS device-memory pool
+    // last left there. Doing it here covers both entry points, since sygvdx
+    // reaches the divide-and-conquer path through this template.
+    // (`splits` is deliberately absent: rocsolver_stedc_template zeroes it itself.)
+    {
+        size_t size_scalars, size_tmpT, size_work1, size_work2, size_work3, size_work4, size_work5,
+            size_work6_ifail, size_D, size_E, size_iblock, size_isplit, size_tau,
+            size_nsplit_workArr;
+        rocsolver_syevdx_heevdx_getMemorySize<BATCHED, T, S>(
+            evect, uplo, n, batch_count, &size_scalars, &size_tmpT, &size_work1, &size_work2,
+            &size_work3, &size_work4, &size_work5, &size_work6_ifail, &size_D, &size_E,
+            &size_iblock, &size_isplit, &size_tau, &size_nsplit_workArr);
+
+        // Memory in `scalars` has already been initialized at this point
+        HIP_CHECK(hipMemsetAsync((void*)tmpT, 0, size_tmpT, stream));
+        HIP_CHECK(hipMemsetAsync((void*)work1, 0, size_work1, stream));
+        HIP_CHECK(hipMemsetAsync((void*)work2, 0, size_work2, stream));
+        HIP_CHECK(hipMemsetAsync((void*)work3, 0, size_work3, stream));
+        HIP_CHECK(hipMemsetAsync((void*)work4, 0, size_work4, stream));
+        // work5 is stedcx/stedc's `tmpz`; rocsolver_stedc_template zeroes it itself.
+        HIP_CHECK(hipMemsetAsync((void*)D, 0, size_D, stream));
+        HIP_CHECK(hipMemsetAsync((void*)E, 0, size_E, stream));
+        HIP_CHECK(hipMemsetAsync((void*)iblock, 0, size_iblock, stream));
+        HIP_CHECK(hipMemsetAsync((void*)isplit, 0, size_isplit, stream));
+        HIP_CHECK(hipMemsetAsync((void*)tau, 0, size_tau, stream));
+        HIP_CHECK(hipMemsetAsync((void*)nsplit_workArr, 0, size_nsplit_workArr, stream));
+    }
+
     const rocblas_stride stride = n;
 
     // reduce A to tridiagonal form
