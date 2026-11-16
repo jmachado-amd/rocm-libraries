@@ -198,6 +198,12 @@ void syevd_heevd_default_initData(const rocblas_handle handle,
     }
 }
 
+// Temporary: carries the exact EIG7 eigendecomposition from initData to getError so the
+// computed pairs can be scored against the construction instead of against another solver.
+inline std::vector<double> g_eig7_Q;
+inline std::vector<double> g_eig7_eigs;
+inline rocblas_int g_eig7_n = 0;
+
 // Creates an `n` by `n` matrix `A` with the following eigenvalues:
 //
 // spectrum(A) = { l_i = ulp * i, for 1 <= i <= n - 1; l_n = 1 }
@@ -230,12 +236,32 @@ void syevd_heevd_eig7_initData(const rocblas_handle handle,
             auto hAw = HMat::Wrap(hA[b], lda, n);
             if(hAw) // update matrix hA if n >= 1
             {
-                auto eigs = std::numeric_limits<S>::epsilon() * HMat::FromRange(1, n - 1, n - 1);
+                S ulp = (std::getenv("TEST_ULP") != nullptr)
+                    ? (S)atof(std::getenv("TEST_ULP"))
+                    : std::numeric_limits<S>::epsilon();
+                auto eigs = ulp * HMat::FromRange(1, n - 1, n - 1);
                 eigs = cat(eigs, HMat::Ones(1, 1));
                 auto [Q, _] = qr((*hAw).block(BDesc().nrows(n).ncols(n)));
                 hAw->set_to_zero();
 
                 hAw->copy_data_from(Q * HMat::Zeros(n).diag(eigs) * adjoint(Q));
+
+                // Temporary: stash the exact eigendecomposition. The eigenvalues are
+                // distinct, so Q's columns are the exact eigenvectors up to sign.
+                if(std::getenv("TEST_EXACT_REF") != nullptr)
+                {
+                    std::vector<T> Qbuf((size_t)n * n);
+                    auto Qw = HMat::Wrap(Qbuf.data(), n, n);
+                    Qw->copy_data_from(Q);
+                    g_eig7_n = n;
+                    g_eig7_Q.assign((size_t)n * n, 0.0);
+                    for(size_t k = 0; k < (size_t)n * n; ++k)
+                        g_eig7_Q[k] = (double)std::real(Qbuf[k]);
+                    g_eig7_eigs.assign(n, 0.0);
+                    for(rocblas_int k = 0; k < n - 1; ++k)
+                        g_eig7_eigs[k] = (double)ulp * (double)(k + 1);
+                    g_eig7_eigs[n - 1] = 1.0;
+                }
             }
 
             // make copy of original data to test vectors if required
@@ -601,6 +627,29 @@ void syevd_heevd_getError(const rocblas_handle handle,
             if(hinfo[b][0] == 0)
                 err = norm_error('F', 1, n, 1, hD[b], hDres[b]);
             *max_err = err > *max_err ? err : *max_err;
+
+            // Temporary: per-eigenvalue relative comparison. The aggregate metric above
+            // normalizes by ||hD||, which hides errors in eigenvalues far below ||A||.
+            if(std::getenv("TEST_DUMP_EVALS") != nullptr && hinfo[b][0] == 0)
+            {
+                double worst = 0;
+                int worst_i = -1;
+                for(rocblas_int i = 0; i < n; ++i)
+                {
+                    double ref = (double)hD[b][i], got = (double)hDres[b][i];
+                    double rel = (ref != 0) ? std::abs(got - ref) / std::abs(ref) : std::abs(got);
+                    printf("[eval] b=%d i=%4d lapack=% .17e rocsolver=% .17e relerr=%.3e\n", (int)b,
+                           (int)i, ref, got, rel);
+                    if(rel > worst)
+                    {
+                        worst = rel;
+                        worst_i = (int)i;
+                    }
+                }
+                printf("[eval] b=%d WORST relative error = %.6e at i=%d  (aggregate ||.||/||hD|| "
+                       "= %.6e)\n",
+                       (int)b, worst, worst_i, err);
+            }
         }
         else
         {
@@ -627,6 +676,110 @@ void syevd_heevd_getError(const rocblas_handle handle,
                 auto RE = M - U * D * adjoint(U);
                 err = RE.norm() / M.norm();
                 *max_err = err > *max_err ? err : *max_err;
+
+                // Temporary: score each computed pair against the exact construction.
+                // The eigenvalues are distinct, so Q's columns are the exact eigenvectors
+                // up to sign, and no second solver is needed as a reference.
+                if(std::getenv("TEST_EXACT_REF") != nullptr && g_eig7_n == n && b == 0)
+                {
+                    if constexpr(!rocblas_is_complex<T>)
+                    {
+                        auto sinang = [&](const T* MM, rocblas_int ldm, rocblas_int col) {
+                            double dot = 0, nm = 0;
+                            for(rocblas_int r = 0; r < n; ++r)
+                            {
+                                double v = (double)std::real(MM[(size_t)r + (size_t)col * ldm]);
+                                dot += v * g_eig7_Q[(size_t)r + (size_t)col * n];
+                                nm += v * v;
+                            }
+                            nm = std::sqrt(nm);
+                            double c = (nm > 0) ? std::abs(dot) / nm : 0.0;
+                            c = std::min(1.0, std::max(0.0, c));
+                            return std::sqrt(std::max(0.0, 1.0 - c * c));
+                        };
+                        printf("[exact] col :  lambda_exact   roc_eval_relerr  lap_eval_relerr  "
+                               "roc_evec_sin  lap_evec_sin\n");
+                        for(rocblas_int i = 0; i < n; ++i)
+                        {
+                            double le = g_eig7_eigs[i];
+                            double rr = std::abs((double)hDres[b][i] - le) / std::abs(le);
+                            double lr = std::abs((double)hD[b][i] - le) / std::abs(le);
+                            printf("[exact] %4d  %.6e   %.4e   %.4e   %.4e   %.4e\n", (int)i, le,
+                                   rr, lr, sinang(hAres[b], lda, i), sinang(hA[b], lda, i));
+                        }
+                    }
+                }
+
+                // Temporary: reference = exact eigenpairs of the matrix actually stored.
+                // Promoting the float A to double and solving there removes the error that
+                // forming A = Q*L*Q^T in float already baked in, so any remaining deviation
+                // belongs to the single-precision solver rather than to the construction.
+                if(std::getenv("TEST_DBL_REF") != nullptr && b == 0)
+                {
+                    if constexpr(!rocblas_is_complex<T>)
+                    {
+                        std::vector<double> rA((size_t)n * n), rD(n);
+                        for(rocblas_int j = 0; j < n; ++j)
+                            for(rocblas_int i2 = 0; i2 < n; ++i2)
+                                rA[(size_t)i2 + (size_t)j * n]
+                                    = (double)std::real(A[(size_t)b * lda * n + i2 + (size_t)j * lda]);
+
+                        // real path: LAPACK's work array arrives via rwork/lrwork, lwork = 0
+                        rocblas_int rlwork = 0, rlrwork = 1 + 6 * n + 2 * n * n,
+                                    rliwork = 3 + 5 * n;
+                        std::vector<double> rwork2(1), rE((size_t)rlrwork);
+                        std::vector<int> riwork(rliwork);
+                        rocblas_int rinfo = 0;
+                        cpu_syevd_heevd(rocblas_evect_original, uplo, n, rA.data(), n, rD.data(),
+                                        rwork2.data(), rlwork, rE.data(), rlrwork, riwork.data(),
+                                        rliwork, &rinfo);
+
+                        auto sinang2 = [&](const T* MM, rocblas_int ldm, rocblas_int col) {
+                            double dot = 0, nm = 0;
+                            for(rocblas_int r = 0; r < n; ++r)
+                            {
+                                double v = (double)std::real(MM[(size_t)r + (size_t)col * ldm]);
+                                dot += v * rA[(size_t)r + (size_t)col * n];
+                                nm += v * v;
+                            }
+                            nm = std::sqrt(nm);
+                            double c = (nm > 0) ? std::abs(dot) / nm : 0.0;
+                            c = std::min(1.0, std::max(0.0, c));
+                            return std::sqrt(std::max(0.0, 1.0 - c * c));
+                        };
+
+                        // Same reduction, different tridiagonal solver: QR iteration instead
+                        // of divide and conquer, so it performs no deflation at all. If this
+                        // recovers pairs that syevd loses, the information survives in single
+                        // precision and the loss is algorithmic rather than conditioning.
+                        std::vector<T> qrA((size_t)lda * n);
+                        std::vector<S> qrD(n);
+                        for(rocblas_int j = 0; j < n; ++j)
+                            for(rocblas_int i2 = 0; i2 < n; ++i2)
+                                qrA[(size_t)i2 + (size_t)j * lda]
+                                    = A[(size_t)b * lda * n + i2 + (size_t)j * lda];
+                        rocblas_int qlwork = 0, qlrwork = std::max(1, 3 * n - 1), qinfo = 0;
+                        std::vector<T> qwork(1);
+                        std::vector<S> qrwork((size_t)qlrwork);
+                        cpu_syev_heev(rocblas_evect_original, uplo, n, qrA.data(), lda, qrD.data(),
+                                      qwork.data(), qlwork, qrwork.data(), qlrwork, &qinfo);
+
+                        printf("[dblref] rinfo=%d qrinfo=%d  col  lambda_ref  roc_eval_relerr  "
+                               "lap_eval_relerr  qr_eval_relerr  roc_evec_sin  lap_evec_sin  "
+                               "qr_evec_sin\n",
+                               (int)rinfo, (int)qinfo);
+                        for(rocblas_int i = 0; i < n; ++i)
+                        {
+                            double le = rD[i];
+                            double den = std::max(std::abs(le), 1e-300);
+                            printf("[dblref] %4d  %.6e  %.4e  %.4e  %.4e  %.4e  %.4e  %.4e\n",
+                                   (int)i, le, std::abs((double)hDres[b][i] - le) / den,
+                                   std::abs((double)hD[b][i] - le) / den,
+                                   std::abs((double)qrD[i] - le) / den, sinang2(hAres[b], lda, i),
+                                   sinang2(hA[b], lda, i), sinang2(qrA.data(), lda, i));
+                        }
+                    }
+                }
             }
         }
     }

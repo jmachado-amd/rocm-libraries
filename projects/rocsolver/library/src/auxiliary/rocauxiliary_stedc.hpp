@@ -54,8 +54,25 @@ ROCSOLVER_BEGIN_NAMESPACE
 #else
 // Using updated secular equation solver
 // Upper bound to number of threads of solver kernel (target number of threads is wave size; set
-// as max of wave sizes accross all supported architectures or larger).
+// as max of wave sizes across all supported architectures or larger).
 #define STEDC_SOLVE_BDIM 64
+#endif
+
+// Temporary instrumentation: set to 1 to trace deflation decisions under both the
+// legacy tolerance max(maxd, maxz) and the corrected max(maxd, abs(p)*maxz).
+#ifndef STEDC_DEBUG_DEFLATION
+#define STEDC_DEBUG_DEFLATION 0
+#endif
+// Set to 1 to restore the original (buggy) tolerance so the failure reproduces.
+#ifndef STEDC_LEGACY_TOL
+#define STEDC_LEGACY_TOL 0
+#endif
+// Set to 1 to report deflations predicted to cost eigenvector accuracy.
+#ifndef STEDC_DETECT_SHELL
+#define STEDC_DETECT_SHELL 1
+#endif
+#ifndef STEDC_DETECT_SHELL_THETA
+#define STEDC_DETECT_SHELL_THETA 1e-3
 #endif
 
 // bit indicating base deflation candidate
@@ -558,14 +575,33 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
         maxd = lmaxd[0];
         maxz = lmaxz[0];
 
-        S tolD = 8 * eps * std::max(maxd, maxz);
-        S tolZ = 8 * eps * std::max(maxd, maxz);
+        // z is stored unscaled, but the deflation test below compares abs(p * z),
+        // so the z term of the tolerance must carry the same abs(p) factor.
+        S tol_fixed = 8 * eps * std::max(maxd, std::abs(p) * maxz);
+        S tol_legacy = 8 * eps * std::max(maxd, maxz);
+#if STEDC_LEGACY_TOL
+        S tolD = tol_legacy;
+        S tolZ = tol_legacy;
+#else
+        S tolD = tol_fixed;
+        S tolZ = tol_fixed;
+#endif
         // store tolerances in global memory
         for(int i = hipThreadIdx_x; i < sz; i += hipBlockDim_x)
         {
             tolsD[p1 + i] = tolD;
             tolsZ[p1 + i] = tolZ;
         }
+
+#if STEDC_DEBUG_DEFLATION
+        __syncthreads();
+        if(hipThreadIdx_x == 0)
+            printf("[defl] k=%d sid=%d p1=%d sz=%d p=% .6e maxd=%.6e maxz=%.6e "
+                   "tol_legacy=%.6e tol_fixed=%.6e ratio=%.3e\n",
+                   k, sid, p1, sz, (double)p, (double)maxd, (double)maxz, (double)tol_legacy,
+                   (double)tol_fixed, (double)(tol_legacy / tol_fixed));
+        __syncthreads();
+#endif
 
         // 3. deflate eigenvalues
         // ----------------------------------------------------------------
@@ -575,7 +611,58 @@ ROCSOLVER_KERNEL void __launch_bounds__(STEDC_BDIM)
             S g = z[p1 + i];
             // deflated ev if component in z is zero
             mask[p1 + i] = (abs(p * g) <= tolZ) ? 0 : 1;
+#if STEDC_DEBUG_DEFLATION
+            int m_legacy = (abs(p * g) <= tol_legacy) ? 0 : 1;
+            int m_fixed = (abs(p * g) <= tol_fixed) ? 0 : 1;
+            printf("[defl]   k=%d sid=%d i=%3d d=% .6e z=% .6e |p*z|=%.6e "
+                   "legacy=%s fixed=%s%s\n",
+                   k, sid, p1 + i, (double)D[p1 + i], (double)g, (double)abs(p * g),
+                   m_legacy ? "SOLVE" : "defl ", m_fixed ? "SOLVE" : "defl ",
+                   (m_legacy != m_fixed) ? "   <== DIVERGE" : "");
+#endif
         }
+
+#if STEDC_DETECT_SHELL
+        // Detector for the boundary layer where zero-z deflation can cost eigenvector
+        // accuracy: component i deflates (|p*z_i| <= tol) while some d_j sits just far
+        // enough away that the repeated-value (Givens) criterion does not fire
+        // (gap > tol), yet close enough that theta ~ |p*z_i|*|z_j|/gap is not small.
+        __syncthreads();
+        for(int i = hipThreadIdx_x; i < sz; i += hipBlockDim_x)
+        {
+            S pzi = std::abs(p * z[p1 + i]);
+            if(pzi > tolZ)
+                continue; // not deflated
+            S di = D[p1 + i];
+            S worst = 0;
+            int worst_j = -1;
+            S worst_gap = 0, worst_zj = 0;
+            for(int j = 0; j < sz; ++j)
+            {
+                if(j == i)
+                    continue;
+                S gap = std::abs(D[p1 + j] - di);
+                if(gap <= tolD)
+                    continue; // handled exactly by the repeated-value rotation
+                S zj = std::abs(z[p1 + j]);
+                S theta = pzi * zj / gap;
+                if(theta > worst)
+                {
+                    worst = theta;
+                    worst_j = j;
+                    worst_gap = gap;
+                    worst_zj = zj;
+                }
+            }
+            if(worst > S(STEDC_DETECT_SHELL_THETA))
+                printf("[shell] k=%d sid=%d i=%d j=%d |p*zi|=%.6e tol=%.6e ratio=%.3f "
+                       "gap=%.6e gap/tol=%.3f zj=%.6e theta=%.4e\n",
+                       k, sid, p1 + i, p1 + worst_j, (double)pzi, (double)tolZ,
+                       (double)(pzi / tolZ), (double)worst_gap, (double)(worst_gap / tolD),
+                       (double)worst_zj, (double)worst);
+        }
+        __syncthreads();
+#endif
     }
 }
 
@@ -1420,7 +1507,7 @@ __device__ I laed4_alt(I n,
 
     S d1 = DELTA(1);
     S di = DELTA(i);
-    S dnm1 = DELTA(n - 1);
+    S dnm1 = n > 1 ? DELTA(n - 1) : d1;
     S dn = DELTA(n);
 
     rhoinv = S(1.) / rho;

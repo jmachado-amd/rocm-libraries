@@ -120,6 +120,7 @@ void stedc_clement_initData(const rocblas_handle handle,
 {
     using S = decltype(std::real(T{}));
     rocblas_int bc = 1;
+    double eps = (std::getenv("TEST_SCALE") != nullptr) ? atof(std::getenv("TEST_SCALE")) : 1E-7;
 
     if(CPU)
     {
@@ -151,8 +152,8 @@ void stedc_clement_initData(const rocblas_handle handle,
                 }
 
                 hCw->copy_data_from(C);
-                hDw->copy_data_from(D);
-                hEw->copy_data_from(E);
+                hDw->copy_data_from(eps*D);
+                hEw->copy_data_from(eps*E);
             }
         }
     }
@@ -190,6 +191,7 @@ void stedc_toeplitz_initData(const rocblas_handle handle,
 {
     using S = decltype(std::real(T{}));
     rocblas_int bc = 1;
+    double eps = (std::getenv("TEST_SCALE") != nullptr) ? atof(std::getenv("TEST_SCALE")) : 1E-7;
 
     if(CPU)
     {
@@ -216,8 +218,8 @@ void stedc_toeplitz_initData(const rocblas_handle handle,
                 auto E = HMatS::Ones(n - 1, 1);
 
                 hCw->copy_data_from(C);
-                hDw->copy_data_from(D);
-                hEw->copy_data_from(E);
+                hDw->copy_data_from(eps*D);
+                hEw->copy_data_from(eps*E);
             }
         }
     }
@@ -251,6 +253,7 @@ void stedc_identity_initData(const rocblas_handle handle,
 {
     using S = decltype(std::real(T{}));
     rocblas_int bc = 1;
+    double eps = (std::getenv("TEST_SCALE") != nullptr) ? atof(std::getenv("TEST_SCALE")) : 1E-7;
 
     if(CPU)
     {
@@ -277,8 +280,8 @@ void stedc_identity_initData(const rocblas_handle handle,
                 auto E = HMatS::Zeros(n - 1, 1);
 
                 hCw->copy_data_from(C);
-                hDw->copy_data_from(D);
-                hEw->copy_data_from(E);
+                hDw->copy_data_from(eps*D);
+                hEw->copy_data_from(eps*E);
             }
         }
     }
@@ -324,6 +327,7 @@ void stedc_wilkinson_initData(const rocblas_handle handle,
 {
     using S = decltype(std::real(T{}));
     rocblas_int bc = 1;
+    double eps = (std::getenv("TEST_SCALE") != nullptr) ? atof(std::getenv("TEST_SCALE")) : 1E-7;
 
     if(CPU)
     {
@@ -357,8 +361,8 @@ void stedc_wilkinson_initData(const rocblas_handle handle,
                 }
 
                 hCw->copy_data_from(C);
-                hDw->copy_data_from(D);
-                hEw->copy_data_from(E);
+                hDw->copy_data_from(eps*D);
+                hEw->copy_data_from(eps*E);
             }
         }
     }
@@ -571,6 +575,84 @@ void stedc_default_initData(const rocblas_handle handle,
     }
 }
 
+// Creates the tridiagonal reduction of an `n` by `n` matrix with spectrum
+//
+//   { l_i = ulp * i, for 1 <= i <= n - 1; l_n = 1 }
+//
+// i.e. the EIG7 spectrum, but reduced to tridiagonal form with cpu_sytrd so that the
+// exact same D, E can be handed to both rocSOLVER and LAPACK. ||A|| = 1, so dstedc's
+// ORGNRM normalization is a no-op. `ulp` defaults to the working precision's epsilon
+// but can be pinned with TEST_ULP so that a float and a double run share one matrix.
+template <bool CPU, bool GPU, typename T, typename Sd, typename Td, typename Ud, typename Sh, typename Th, typename Uh>
+void stedc_eig7_initData(const rocblas_handle handle,
+                         const rocblas_evect evect,
+                         const rocblas_int n,
+                         Sd& dD,
+                         Sd& dE,
+                         Td& dC,
+                         const rocblas_int ldc,
+                         Ud& dInfo,
+                         Sh& hD,
+                         Sh& hE,
+                         Th& hC,
+                         Uh& hInfo)
+{
+    using S = decltype(std::real(T{}));
+    rocblas_int bc = 1;
+
+    if(CPU)
+    {
+        rocblas_init<T>(hC, true);
+
+        for(rocblas_int b = 0; b < bc; ++b)
+        {
+            using HMatT = HostMatrix<T, rocblas_int>;
+            using HMatS = HostMatrix<S, rocblas_int>;
+            using BDescT = typename HMatT::BlockDescriptor;
+
+            auto hCw = HMatT::Wrap(hC[b], ldc, n);
+            hCw->set_to_zero();
+            auto hDw = HMatS::Wrap(hD[b], n, 1);
+            hDw->set_to_zero();
+            auto hEw = HMatS::Wrap(hE[b], n, 1);
+            hEw->set_to_zero();
+
+            if(hCw && hDw && hEw && n > 1)
+            {
+                S ulp = (std::getenv("TEST_ULP") != nullptr)
+                    ? (S)atof(std::getenv("TEST_ULP"))
+                    : std::numeric_limits<S>::epsilon();
+
+                // dense A = Q * diag(eigs) * Q^H with ||A|| = 1
+                std::vector<T> A((size_t)n * n);
+                auto Aw = HMatT::Wrap(A.data(), n, n);
+                rocblas_init<T>(A.data(), n, n, n);
+                auto seed = HMatT::Wrap(A.data(), n, n)->block(BDescT().nrows(n).ncols(n));
+                auto [Q, _] = qr(seed);
+                auto eigs = ulp * HMatT::FromRange(1, n - 1, n - 1);
+                eigs = cat(eigs, HMatT::Ones(1, 1));
+                Aw->copy_data_from(Q * HMatT::Zeros(n).diag(eigs) * adjoint(Q));
+
+                // reduce to tridiagonal form; D and E then define the test problem
+                std::vector<T> tau(n), work((size_t)n * n);
+                cpu_sytrd_hetrd(rocblas_fill_lower, n, A.data(), n, hD[b], hE[b], tau.data(),
+                                work.data(), (rocblas_int)work.size());
+
+                hCw->copy_data_from(HMatT::Eye(n, n));
+            }
+        }
+    }
+
+    if(GPU)
+    {
+        CHECK_HIP_ERROR(dD.transfer_from(hD));
+        CHECK_HIP_ERROR(dE.transfer_from(hE));
+
+        if(evect == rocblas_evect_original)
+            CHECK_HIP_ERROR(dC.transfer_from(hC));
+    }
+}
+
 template <bool CPU, bool GPU, typename T, typename Sd, typename Td, typename Ud, typename Sh, typename Th, typename Uh>
 void stedc_initData(const rocblas_handle handle,
                     const rocblas_evect evect,
@@ -585,7 +667,13 @@ void stedc_initData(const rocblas_handle handle,
                     Th& hC,
                     Uh& hInfo)
 {
-    if((std::getenv("TEST_WILKINSON") != nullptr) || (std::getenv("STEDC_TEST_WILKINSON") != nullptr))
+    if((std::getenv("TEST_EIG7") != nullptr) || (std::getenv("STEDC_TEST_EIG7") != nullptr))
+    {
+        stedc_eig7_initData<CPU, GPU, T>(handle, evect, n, dD, dE, dC, ldc, dInfo, hD, hE, hC,
+                                         hInfo);
+    }
+    else if((std::getenv("TEST_WILKINSON") != nullptr)
+            || (std::getenv("STEDC_TEST_WILKINSON") != nullptr))
     {
         stedc_wilkinson_initData<CPU, GPU, T>(handle, evect, n, dD, dE, dC, ldc, dInfo, hD, hE, hC,
                                               hInfo);
@@ -692,8 +780,82 @@ void stedc_getError(const rocblas_handle handle,
     }
 
     // CPU lapack
+    // Temporary: keep the input tridiagonal so a double-precision reference can be run
+    // on the exact same D, E after cpu_stedc overwrites them.
+    std::vector<S> refD, refE;
+    const bool want_evec_ref
+        = (std::getenv("TEST_EVEC_REF") != nullptr) && (evect != rocblas_evect_none) && (n > 1);
+    if(want_evec_ref)
+    {
+        refD.assign(hD[0], hD[0] + n);
+        refE.assign(hE[0], hE[0] + n);
+    }
+
     cpu_stedc(evect, n, hD[0], hE[0], hC[0], ldc, work.data(), lwork, rwork.data(), lrwork,
               iwork.data(), liwork, hInfo[0]);
+
+    // Temporary: three-way eigenvector comparison. Solve the same tridiagonal in double,
+    // whose deflation tolerance is ~1e9 times finer than the eigenvalue spacing and so
+    // sits far outside the regime under investigation, and use it as the reference for
+    // both the rocSOLVER result and LAPACK's own single-precision result. If both float
+    // results deviate equally the eigenvectors are simply ill-conditioned; if rocSOLVER
+    // deviates further, the deflation criterion is implicated.
+    if(want_evec_ref)
+    {
+        if constexpr(!rocblas_is_complex<T>)
+        {
+            std::vector<double> dD(refD.begin(), refD.end()), dE(refE.begin(), refE.end());
+            std::vector<double> dC((size_t)n * n, 0.0);
+            for(rocblas_int i = 0; i < n; ++i)
+                dC[(size_t)i + (size_t)i * n] = 1.0;
+
+            int lgn2 = (int)std::floor(std::log((double)(n - 1)) / std::log(2.0)) + 1;
+            std::vector<double> dwork(1), drwork(1 + 4 * n + 4 * (size_t)n * n + 2 * (size_t)n * lgn2);
+            std::vector<rocblas_int> diwork(6 + 6 * n + 5 * (size_t)n * lgn2);
+            rocblas_int dinfo = 0;
+            cpu_stedc(rocblas_evect_tridiagonal, n, dD.data(), dE.data(), dC.data(), n,
+                      dwork.data(), (rocblas_int)dwork.size(), drwork.data(),
+                      (rocblas_int)drwork.size(), diwork.data(), (rocblas_int)diwork.size(), &dinfo);
+
+            auto angle = [&](const T* M, rocblas_int ldm, rocblas_int col) {
+                double dot = 0, nm = 0;
+                for(rocblas_int r = 0; r < n; ++r)
+                {
+                    double v = (double)std::real(M[(size_t)r + (size_t)col * ldm]);
+                    dot += v * dC[(size_t)r + (size_t)col * n];
+                    nm += v * v;
+                }
+                nm = std::sqrt(nm);
+                double c = (nm > 0) ? std::abs(dot) / nm : 0.0;
+                c = std::min(1.0, std::max(0.0, c));
+                return std::sqrt(std::max(0.0, 1.0 - c * c)); // sin(angle)
+            };
+
+            double wr = 0, wl = 0;
+            int wri = -1, wli = -1;
+            printf("[evec] dinfo=%d  (col : sin_angle_rocsolver  sin_angle_lapack_float)\n", dinfo);
+            for(rocblas_int i = 0; i < n; ++i)
+            {
+                double ar = angle(hCRes[0], ldc, i);
+                double al = angle(hC[0], ldc, i);
+                if(ar > wr)
+                {
+                    wr = ar;
+                    wri = i;
+                }
+                if(al > wl)
+                {
+                    wl = al;
+                    wli = i;
+                }
+                if(ar > 1e-3 || al > 1e-3)
+                    printf("[evec] col=%4d  rocsolver=%.4e  lapack_float=%.4e  ratio=%.3f\n",
+                           (int)i, ar, al, (al > 0) ? ar / al : 0.0);
+            }
+            printf("[evec] WORST rocsolver=%.4e (col %d)   WORST lapack_float=%.4e (col %d)\n", wr,
+                   wri, wl, wli);
+        }
+    }
 
     // Depending on `evect`, stedc can return the eigenvectors of the original
     // matrix (A) or the eigenvectors of the tridiagonal matrix (T).  Thus,
