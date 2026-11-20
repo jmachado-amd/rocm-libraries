@@ -653,6 +653,149 @@ void stedc_eig7_initData(const rocblas_handle handle,
     }
 }
 
+// Block diagonal tridiagonal with a small but non-negligible coupling off-diagonal.
+//
+//   [ s * Toeplitz(2,1)   c              ]        s = MIXED_SCALE   (top block scale)
+//   [ c                   EIG7 reduction ]        c = MIXED_COUPLING
+//
+// The bottom block is O(1) and fixes ||T|| ~ 1, so a ScaLAPACK-style global ORGNRM
+// rescale is a no-op. The top block is still tiny in absolute terms, so every merge
+// internal to it sees maxd ~ s while maxz stays O(1) -- the same mismatch as the
+// uniformly scaled case, untouched by a global rescale. The coupling is kept above
+// LAPACK's splitting threshold eps*sqrt(|d_i d_i+1|) so that sstedc treats this as one
+// irreducible block and performs a single global rescale, matching ScaLAPACK.
+template <bool CPU, bool GPU, typename T, typename Sd, typename Td, typename Ud, typename Sh, typename Th, typename Uh>
+void stedc_mixed_initData(const rocblas_handle handle,
+                          const rocblas_evect evect,
+                          const rocblas_int n,
+                          Sd& dD,
+                          Sd& dE,
+                          Td& dC,
+                          const rocblas_int ldc,
+                          Ud& dInfo,
+                          Sh& hD,
+                          Sh& hE,
+                          Th& hC,
+                          Uh& hInfo)
+{
+    using S = decltype(std::real(T{}));
+    rocblas_int bc = 1;
+
+    if(CPU)
+    {
+        rocblas_init<T>(hC, true);
+
+        for(rocblas_int b = 0; b < bc; ++b)
+        {
+            using HMatT = HostMatrix<T, rocblas_int>;
+            using HMatS = HostMatrix<S, rocblas_int>;
+            using BDescT = typename HMatT::BlockDescriptor;
+
+            auto hCw = HMatT::Wrap(hC[b], ldc, n);
+            hCw->set_to_zero();
+            auto hDw = HMatS::Wrap(hD[b], n, 1);
+            hDw->set_to_zero();
+            auto hEw = HMatS::Wrap(hE[b], n, 1);
+            hEw->set_to_zero();
+
+            if(hCw && hDw && hEw && n > 3)
+            {
+                // MIXED_BOT=one reduces the bottom block to a single entry equal to 1.
+                // That alone pins ORGNRM = 1 (so a global rescale is a no-op) while the
+                // whole rest of the matrix stays at scale s, with no structure of its own
+                // to confound the measurement.
+                const char* botenv = std::getenv("MIXED_BOT");
+                const bool bot_one = (botenv != nullptr) && (std::string(botenv) == "one");
+
+                rocblas_int n1 = (std::getenv("MIXED_N1") != nullptr)
+                    ? (rocblas_int)atoi(std::getenv("MIXED_N1"))
+                    : (bot_one ? n - 1 : n / 2);
+                n1 = std::max((rocblas_int)2, std::min(n - 1, n1));
+                rocblas_int n2 = n - n1;
+
+                S s = (std::getenv("MIXED_SCALE") != nullptr)
+                    ? (S)atof(std::getenv("MIXED_SCALE"))
+                    : (S)5e-7;
+                S c = (std::getenv("MIXED_COUPLING") != nullptr)
+                    ? (S)atof(std::getenv("MIXED_COUPLING"))
+                    : (S)1e-9;
+
+                // ---- top block: scaled Toeplitz, tridiag(1, 2, 1) * s
+                for(rocblas_int i = 0; i < n1; ++i)
+                    hD[b][i] = s * S(2);
+                for(rocblas_int i = 0; i + 1 < n1; ++i)
+                    hE[b][i] = s;
+
+                // ---- coupling between the two blocks
+                hE[b][n1 - 1] = c;
+
+                // ---- bottom block
+                S ulp = (std::getenv("TEST_ULP") != nullptr)
+                    ? (S)atof(std::getenv("TEST_ULP"))
+                    : std::numeric_limits<S>::epsilon();
+
+                if(n2 == 1)
+                {
+                    // single entry; its value alone fixes ||T||
+                    S bv = (std::getenv("MIXED_BOTVAL") != nullptr)
+                        ? (S)atof(std::getenv("MIXED_BOTVAL"))
+                        : S(1);
+                    hD[b][n - 1] = bv;
+                }
+                else
+                {
+                std::vector<T> A2((size_t)n2 * n2);
+                auto A2w = HMatT::Wrap(A2.data(), n2, n2);
+                rocblas_init<T>(A2.data(), n2, n2, n2);
+                auto seed = HMatT::Wrap(A2.data(), n2, n2)->block(BDescT().nrows(n2).ncols(n2));
+                auto [Q, _] = qr(seed);
+                auto eigs = ulp * HMatT::FromRange(1, n2 - 1, n2 - 1);
+                eigs = cat(eigs, HMatT::Ones(1, 1));
+                A2w->copy_data_from(Q * HMatT::Zeros(n2).diag(eigs) * adjoint(Q));
+
+                std::vector<S> d2(n2), e2(n2);
+                std::vector<T> tau(n2), work((size_t)n2 * n2);
+                cpu_sytrd_hetrd(rocblas_fill_lower, n2, A2.data(), n2, d2.data(), e2.data(),
+                                tau.data(), work.data(), (rocblas_int)work.size());
+
+                for(rocblas_int i = 0; i < n2; ++i)
+                    hD[b][n1 + i] = d2[i];
+                for(rocblas_int i = 0; i + 1 < n2; ++i)
+                    hE[b][n1 + i] = e2[i];
+                }
+
+                hCw->copy_data_from(HMatT::Eye(n, n));
+
+                if(std::getenv("MIXED_VERBOSE") != nullptr)
+                {
+                    S maxall = 0, maxtop = 0;
+                    for(rocblas_int i = 0; i < n; ++i)
+                        maxall = std::max(maxall, std::abs(hD[b][i]));
+                    for(rocblas_int i = 0; i + 1 < n; ++i)
+                        maxall = std::max(maxall, std::abs(hE[b][i]));
+                    for(rocblas_int i = 0; i < n1; ++i)
+                        maxtop = std::max(maxtop, std::abs(hD[b][i]));
+                    printf("[mixed] n=%d n1=%d n2=%d s=%.3e c=%.3e  ORGNRM=%.3e  top_scale=%.3e  "
+                           "split_thresh~%.3e\n",
+                           (int)n, (int)n1, (int)n2, (double)s, (double)c, (double)maxall,
+                           (double)maxtop,
+                           (double)(std::numeric_limits<S>::epsilon()
+                                    * std::sqrt(std::abs(hD[b][n1 - 1]) * std::abs(hD[b][n1]))));
+                }
+            }
+        }
+    }
+
+    if(GPU)
+    {
+        CHECK_HIP_ERROR(dD.transfer_from(hD));
+        CHECK_HIP_ERROR(dE.transfer_from(hE));
+
+        if(evect == rocblas_evect_original)
+            CHECK_HIP_ERROR(dC.transfer_from(hC));
+    }
+}
+
 template <bool CPU, bool GPU, typename T, typename Sd, typename Td, typename Ud, typename Sh, typename Th, typename Uh>
 void stedc_initData(const rocblas_handle handle,
                     const rocblas_evect evect,
@@ -667,7 +810,12 @@ void stedc_initData(const rocblas_handle handle,
                     Th& hC,
                     Uh& hInfo)
 {
-    if((std::getenv("TEST_EIG7") != nullptr) || (std::getenv("STEDC_TEST_EIG7") != nullptr))
+    if((std::getenv("TEST_MIXED") != nullptr) || (std::getenv("STEDC_TEST_MIXED") != nullptr))
+    {
+        stedc_mixed_initData<CPU, GPU, T>(handle, evect, n, dD, dE, dC, ldc, dInfo, hD, hE, hC,
+                                          hInfo);
+    }
+    else if((std::getenv("TEST_EIG7") != nullptr) || (std::getenv("STEDC_TEST_EIG7") != nullptr))
     {
         stedc_eig7_initData<CPU, GPU, T>(handle, evect, n, dD, dE, dC, ldc, dInfo, hD, hE, hC,
                                          hInfo);
@@ -831,29 +979,45 @@ void stedc_getError(const rocblas_handle handle,
                 return std::sqrt(std::max(0.0, 1.0 - c * c)); // sin(angle)
             };
 
-            double wr = 0, wl = 0;
-            int wri = -1, wli = -1;
-            printf("[evec] dinfo=%d  (col : sin_angle_rocsolver  sin_angle_lapack_float)\n", dinfo);
+            // QR control on the identical tridiagonal, in the same single precision.
+            // steqr performs no deflation, so if it resolves pairs that stedc loses the
+            // information is present in float and the loss is attributable to D&C.
+            std::vector<S> qD(refD.begin(), refD.end()), qE(refE.begin(), refE.end());
+            std::vector<T> qC((size_t)ldc * n, T(0));
+            for(rocblas_int i = 0; i < n; ++i)
+                qC[(size_t)i + (size_t)i * ldc] = T(1);
+            std::vector<S> qwork((size_t)std::max(1, 2 * n - 2));
+            rocblas_int qinfo = 0;
+            cpu_steqr(rocblas_evect_tridiagonal, n, qD.data(), qE.data(), qC.data(), ldc,
+                      qwork.data(), &qinfo);
+
+            auto angleq = [&](const T* M, rocblas_int ldm, rocblas_int col) {
+                double dot = 0, nm = 0;
+                for(rocblas_int r = 0; r < n; ++r)
+                {
+                    double v = (double)std::real(M[(size_t)r + (size_t)col * ldm]);
+                    dot += v * dC[(size_t)r + (size_t)col * n];
+                    nm += v * v;
+                }
+                nm = std::sqrt(nm);
+                double c = (nm > 0) ? std::abs(dot) / nm : 0.0;
+                c = std::min(1.0, std::max(0.0, c));
+                return std::sqrt(std::max(0.0, 1.0 - c * c));
+            };
+
+            printf("[ref] dinfo=%d qinfo=%d   col  lambda_ref     roc_eval_rel  lap_eval_rel  "
+                   "qr_eval_rel   roc_evec_sin  lap_evec_sin  qr_evec_sin\n",
+                   dinfo, (int)qinfo);
             for(rocblas_int i = 0; i < n; ++i)
             {
-                double ar = angle(hCRes[0], ldc, i);
-                double al = angle(hC[0], ldc, i);
-                if(ar > wr)
-                {
-                    wr = ar;
-                    wri = i;
-                }
-                if(al > wl)
-                {
-                    wl = al;
-                    wli = i;
-                }
-                if(ar > 1e-3 || al > 1e-3)
-                    printf("[evec] col=%4d  rocsolver=%.4e  lapack_float=%.4e  ratio=%.3f\n",
-                           (int)i, ar, al, (al > 0) ? ar / al : 0.0);
+                double le = dD[i];
+                double den = std::max(std::abs(le), 1e-300);
+                printf("[ref] %5d  %.6e  %.4e  %.4e  %.4e  %.4e  %.4e  %.4e\n", (int)i, le,
+                       std::abs((double)hDRes[0][i] - le) / den,
+                       std::abs((double)hD[0][i] - le) / den,
+                       std::abs((double)qD[i] - le) / den, angle(hCRes[0], ldc, i),
+                       angle(hC[0], ldc, i), angleq(qC.data(), ldc, i));
             }
-            printf("[evec] WORST rocsolver=%.4e (col %d)   WORST lapack_float=%.4e (col %d)\n", wr,
-                   wri, wl, wli);
         }
     }
 
